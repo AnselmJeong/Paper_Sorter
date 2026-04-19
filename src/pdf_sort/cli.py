@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 DEFAULT_CONFIG = {
     "api": "ollama",
-    "model": "mistral-large-3:675b-cloud",
+    "model": "minimax-m2.7:cloud",
     "ollama_host": "https://ollama.com",
     "category_guide": {
         "min": 10,
@@ -147,7 +147,7 @@ def _call_ollama(messages: list[dict], cfg: dict) -> str:
     from ollama import Client, ResponseError
 
     host = cfg.get("ollama_host", "https://ollama.com")
-    model = cfg.get("model", "mistral-large-3:675b-cloud")
+    model = cfg.get("model", "minimax-m2.7:cloud")
     client = Client(host=host)
     try:
         response = client.chat(
