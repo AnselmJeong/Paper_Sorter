@@ -1,4 +1,4 @@
-"""paper-sort package."""
+"""pdf-sort package."""
 
 from .cli import main
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""paper-sort: LLM-powered academic paper organizer."""
+"""pdf-sort: LLM-powered academic paper organizer."""
 
 import argparse
 import json
@@ -8,6 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 from datetime import datetime
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Config
@@ -24,14 +25,20 @@ DEFAULT_CONFIG = {
     "duplicated_folder": "_duplicated",
     "uncategorized_folder": "_uncategorized",
     "index_file": "index.json",
+    "incremental_batch_size": 40,
 }
 
 
 def load_config(root: Path) -> dict:
-    config_path = root / "paper_sort_config.json"
+    config_path = root / "pdf_sort_config.json"
+    legacy_config_path = root / "paper_sort_config.json"
     cfg = DEFAULT_CONFIG.copy()
     if config_path.exists():
         with open(config_path, "r") as f:
+            user_cfg = json.load(f)
+        cfg.update(user_cfg)
+    elif legacy_config_path.exists():
+        with open(legacy_config_path, "r") as f:
             user_cfg = json.load(f)
         cfg.update(user_cfg)
     return cfg
@@ -44,8 +51,8 @@ def load_config(root: Path) -> dict:
 def load_index(root: Path, cfg: dict) -> dict:
     """Load index.json. Structure:
     {
-        "categories": { "Category Name": ["file1.pdf", ...], ... },
-        "files": { "file1.pdf": { "category": "...", "added": "..." } },
+        "categories": { "Category Name": ["file1.ext", ...], ... },
+        "files": { "file1.ext": { "category": "...", "added": "..." } },
         "version": 1
     }
     """
@@ -67,20 +74,27 @@ def save_index(root: Path, cfg: dict, index: dict):
 # ---------------------------------------------------------------------------
 
 SPECIAL_DIRS = {"_duplicated", "_uncategorized", ".git", "__pycache__"}
+SUPPORTED_EXTENSIONS = {".pdf", ".epub"}
 
 
-def scan_root_pdfs(root: Path) -> list[str]:
-    """Return PDF filenames sitting directly in root (unclassified)."""
+def _is_supported_document(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+
+def scan_root_documents(root: Path) -> list[str]:
+    """Return supported document filenames sitting directly in root (unclassified)."""
     return sorted(
         f.name for f in root.iterdir()
-        if f.is_file() and f.suffix.lower() == ".pdf"
+        if _is_supported_document(f)
     )
 
 
-def scan_all_pdfs(root: Path) -> list[str]:
-    """Return all PDF filenames recursively (for --init)."""
+def scan_all_documents(root: Path) -> list[str]:
+    """Return all supported document filenames recursively (for --init)."""
     results = []
-    for f in root.rglob("*.pdf"):
+    for f in root.rglob("*"):
+        if not _is_supported_document(f):
+            continue
         rel = f.relative_to(root)
         # skip special dirs
         if any(part in SPECIAL_DIRS for part in rel.parts):
@@ -90,18 +104,24 @@ def scan_all_pdfs(root: Path) -> list[str]:
 
 
 def get_existing_categories(root: Path) -> dict[str, list[str]]:
-    """Scan existing subfolders and their PDFs."""
+    """Scan existing subfolders and their supported documents."""
     cats = {}
     for d in sorted(root.iterdir()):
         if d.is_dir() and d.name not in SPECIAL_DIRS and not d.name.startswith("."):
-            pdfs = sorted(f.name for f in d.iterdir() if f.suffix.lower() == ".pdf")
-            cats[d.name] = pdfs
+            docs = sorted(
+                f.name
+                for f in d.iterdir()
+                if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+            )
+            cats[d.name] = docs
     return cats
 
 
 def extract_title(filename: str) -> str:
-    """Extract human-readable title from filename like '2025 - Author - Title.pdf'."""
-    name = filename.removesuffix(".pdf").removesuffix(".PDF")
+    """Extract human-readable title from filename like '2025 - Author - Title.ext'."""
+    name = filename
+    for ext in SUPPORTED_EXTENSIONS:
+        name = name.removesuffix(ext).removesuffix(ext.upper())
     # Try to extract just the title part after second ' - '
     parts = name.split(" - ", 2)
     if len(parts) >= 3:
@@ -119,19 +139,31 @@ def call_llm(messages: list[dict], cfg: dict) -> str:
     """Call Ollama and return response text."""
     api = cfg.get("api", "ollama")
     if api != "ollama":
-        raise ValueError(f"Unsupported API '{api}'. Set api='ollama' in paper_sort_config.json.")
+        raise ValueError(f"Unsupported API '{api}'. Set api='ollama' in pdf_sort_config.json.")
     return _call_ollama(messages, cfg)
 
 
 def _call_ollama(messages: list[dict], cfg: dict) -> str:
-    from ollama import Client
+    from ollama import Client, ResponseError
 
-    client = Client(host=cfg.get("ollama_host", "https://ollama.com"))
-    response = client.chat(
-        model=cfg.get("model", "mistral-large-3:675b-cloud"),
-        messages=messages,
-        options={"num_ctx": 32768},
-    )
+    host = cfg.get("ollama_host", "https://ollama.com")
+    model = cfg.get("model", "mistral-large-3:675b-cloud")
+    client = Client(host=host)
+    try:
+        response = client.chat(
+            model=model,
+            messages=messages,
+            options={"num_ctx": 32768},
+        )
+    except ResponseError as e:
+        msg = f"Ollama chat failed for model '{model}' at {host}: {e}"
+        if getattr(e, "status_code", None) == 500:
+            msg += (
+                "\nOllama returned HTTP 500 before any classification JSON was produced. "
+                "This is a server/model-side failure; try another --model, verify the "
+                "model is available, or check the Ollama service logs/status."
+            )
+        raise RuntimeError(msg) from e
     return response["message"]["content"]
 
 
@@ -177,7 +209,7 @@ Rules:
 Respond in EXACTLY this JSON format, nothing else:
 {{
     "assignments": [
-        {{"file": "filename.pdf", "category": "Category Name", "confidence": "HIGH"}},
+        {{"file": "filename.ext", "category": "Category Name", "confidence": "HIGH"}},
         ...
     ],
     "new_categories": ["New Category Name", ...]
@@ -197,6 +229,16 @@ def build_categories_context(categories: dict[str, list[str]], max_per_cat: int 
         if more:
             lines.append(f"  {more}")
     return "\n".join(lines)
+
+
+def _chunked(seq: list[str], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _is_uncategorized_category(category: str, cfg: dict) -> bool:
+    """Handle current and legacy uncategorized labels."""
+    return category in {cfg["uncategorized_folder"], "_Uncategorized"}
 
 
 def _effective_category_bounds(total_papers: int, cfg: dict) -> tuple[int, int]:
@@ -274,6 +316,58 @@ def _normalize_category_names(categories: list[str]) -> list[str]:
     return out
 
 
+def _normalize_incremental_assignments(
+    batch: list[str],
+    batch_assignments: object,
+    uncategorized_folder: str,
+) -> tuple[list[dict], int]:
+    """Coerce LLM assignment rows into a safe, uniform structure."""
+    if not isinstance(batch_assignments, list):
+        batch_assignments = []
+
+    valid_confidence = {"HIGH", "MED", "LOW"}
+    allowed_files = set(batch)
+    normalized: list[dict] = []
+    seen_files: set[str] = set()
+    issues = 0
+
+    for row in batch_assignments:
+        if not isinstance(row, dict):
+            issues += 1
+            continue
+
+        fname = row.get("file")
+        if not isinstance(fname, str) or fname not in allowed_files or fname in seen_files:
+            issues += 1
+            continue
+
+        category = row.get("category")
+        if not isinstance(category, str) or not category.strip():
+            category = uncategorized_folder
+            issues += 1
+        else:
+            category = category.strip()
+
+        confidence = row.get("confidence")
+        if not isinstance(confidence, str):
+            confidence = "LOW"
+            issues += 1
+        else:
+            confidence = confidence.strip().upper()
+            if confidence not in valid_confidence:
+                confidence = "LOW"
+                issues += 1
+
+        normalized.append({
+            "file": fname,
+            "category": category,
+            "confidence": confidence,
+        })
+        seen_files.add(fname)
+
+    return normalized, issues
+
+
 def _enforce_incremental_new_category_threshold(
     assignments: list[dict],
     declared_new_categories: list[str],
@@ -322,27 +416,27 @@ def _enforce_incremental_new_category_threshold(
 def run_init(root: Path, cfg: dict, dry: bool = False):
     """Phase 1 initialization: design categories and create subfolders only."""
     print("=" * 60)
-    print("  paper-sort: Initial taxonomy setup")
+    print("  pdf-sort: Initial taxonomy setup")
     print("=" * 60)
 
     existing_cats = get_existing_categories(root)
     if existing_cats:
         print("\nExisting category folders detected.")
         print("Initial full classification only runs on a fresh root without category subfolders.")
-        print("Use default mode (`paper-sort`) for incremental routing.")
+        print("Use default mode (`pdf-sort`) for incremental routing.")
         return
 
-    all_pdfs = scan_all_pdfs(root)
-    if not all_pdfs:
-        print("\nNo PDF files found.")
+    all_docs = scan_all_documents(root)
+    if not all_docs:
+        print("\nNo supported documents found (.pdf, .epub).")
         return
 
-    print(f"\nFound {len(all_pdfs)} PDF files.")
-    min_cats, max_cats = _effective_category_bounds(len(all_pdfs), cfg)
+    print(f"\nFound {len(all_docs)} document file(s) (.pdf, .epub).")
+    min_cats, max_cats = _effective_category_bounds(len(all_docs), cfg)
     print(f"Target category range: {min_cats} to {max_cats}")
 
     # Build prompt
-    file_list = "\n".join(all_pdfs)
+    file_list = "\n".join(all_docs)
     system = INIT_SYSTEM.format(
         min_cats=min_cats,
         max_cats=max_cats,
@@ -429,27 +523,47 @@ def run_init(root: Path, cfg: dict, dry: bool = False):
 
     print(f"\n✅ Taxonomy initialized. {created} folder(s) created.")
     print(f"   Index saved to {cfg['index_file']}")
-    print("   Next step: run `paper-sort` again to route files incrementally.")
+    print("   Next step: run `pdf-sort` again to route files incrementally.")
 
 
 def run_incremental(root: Path, cfg: dict, dry: bool = False):
     """Incremental mode: classify new files in root into existing categories."""
     print("=" * 60)
-    print("  paper-sort: Incremental classification")
+    print("  pdf-sort: Incremental classification")
     print("=" * 60)
 
     index = load_index(root, cfg)
     existing_cats = get_existing_categories(root)
 
+    # Keep uncategorized files re-routable by excluding them from index tracking.
+    files_before = dict(index.get("files", {}))
+    index["files"] = {
+        fname: meta
+        for fname, meta in files_before.items()
+        if not _is_uncategorized_category(meta.get("category", ""), cfg)
+    }
+    if "categories" not in index:
+        index["categories"] = {}
+    categories_before = set(index["categories"].keys())
+    for cat_name in [cfg["uncategorized_folder"], "_Uncategorized"]:
+        if cat_name in index["categories"]:
+            index["categories"].pop(cat_name, None)
+    cleanup_changed = (
+        len(index["files"]) != len(files_before)
+        or set(index["categories"].keys()) != categories_before
+    )
+    if cleanup_changed and not dry:
+        save_index(root, cfg, index)
+
     if not existing_cats:
         print("\nNo existing category folders found.")
-        print("Create initial classification by running `paper-sort` in a fresh root directory.")
+        print("Create initial classification by running `pdf-sort` in a fresh root directory.")
         return
 
     # Scan new files in root
-    new_files = scan_root_pdfs(root)
+    new_files = scan_root_documents(root)
     if not new_files:
-        print("\nNo new PDF files in root directory.")
+        print("\nNo new supported documents (.pdf, .epub) in root directory.")
         return
 
     # Check for duplicates by filename against existing library inventory.
@@ -494,23 +608,76 @@ def run_incremental(root: Path, cfg: dict, dry: bool = False):
 
     context = build_categories_context(existing_cats)
     system = INCREMENTAL_SYSTEM.format(categories_context=context)
-    file_list = "\n".join(truly_new)
-
     print("Calling LLM for classification...")
-    response = call_llm([
-        {"role": "system", "content": system},
-        {"role": "user", "content": f"Classify these new papers:\n\n{file_list}"},
-    ], cfg)
+    batch_size = max(1, int(cfg.get("incremental_batch_size", 40)))
+    assignments: list[dict] = []
+    raw_new_categories: list[str] = []
+    parse_errors = 0
+    assignment_issues = 0
 
-    result = _parse_json_response(response)
-    if not result or "assignments" not in result:
-        print("ERROR: Failed to parse LLM response.")
-        print("Raw response:")
-        print(response[:2000])
-        return
+    with tqdm(total=len(truly_new), desc="Classifying papers", unit="file") as pbar:
+        for batch in _chunked(truly_new, batch_size):
+            batch_list = "\n".join(batch)
+            batch_response = ""
+            batch_result = None
 
-    assignments = result["assignments"]
-    raw_new_categories = result.get("new_categories", [])
+            for _ in range(2):  # light retry for transient malformed output
+                batch_response = call_llm([
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": f"Classify these new papers:\n\n{batch_list}"},
+                ], cfg)
+                batch_result = _parse_json_response(batch_response)
+                if batch_result and "assignments" in batch_result:
+                    break
+
+            if not batch_result or "assignments" not in batch_result:
+                parse_errors += 1
+                # Fail open: keep files routable by pushing them to uncategorized.
+                for fname in batch:
+                    assignments.append({
+                        "file": fname,
+                        "category": cfg["uncategorized_folder"],
+                        "confidence": "LOW",
+                    })
+                pbar.update(len(batch))
+                continue
+
+            batch_assignments, issues = _normalize_incremental_assignments(
+                batch=batch,
+                batch_assignments=batch_result.get("assignments", []),
+                uncategorized_folder=cfg["uncategorized_folder"],
+            )
+            assignment_issues += issues
+            batch_new_categories = batch_result.get("new_categories", [])
+            assignments.extend(batch_assignments)
+            raw_new_categories.extend(batch_new_categories)
+            pbar.update(len(batch))
+
+    if parse_errors:
+        print(
+            f"\n⚠️  {parse_errors} batch(es) had invalid LLM JSON; "
+            f"affected files were routed to {cfg['uncategorized_folder']}."
+        )
+    if assignment_issues:
+        print(
+            f"\n⚠️  Normalized {assignment_issues} malformed assignment field(s); "
+            f"affected files defaulted to {cfg['uncategorized_folder']} or LOW confidence."
+        )
+    # Normalize assignments to exactly one row per incoming file.
+    assignment_by_file: dict[str, dict] = {}
+    for a in assignments:
+        fname = a.get("file")
+        if fname in truly_new and fname not in assignment_by_file:
+            assignment_by_file[fname] = a
+    for fname in truly_new:
+        if fname not in assignment_by_file:
+            assignment_by_file[fname] = {
+                "file": fname,
+                "category": cfg["uncategorized_folder"],
+                "confidence": "LOW",
+            }
+    assignments = [assignment_by_file[f] for f in truly_new]
+
     assignments, new_categories, demoted_new_categories = _enforce_incremental_new_category_threshold(
         assignments=assignments,
         declared_new_categories=raw_new_categories,
@@ -579,15 +746,16 @@ def run_incremental(root: Path, cfg: dict, dry: bool = False):
             shutil.move(str(src), str(dst))
             moved += 1
 
-        # Update index
-        if cat not in index["categories"]:
-            index["categories"][cat] = []
-        index["categories"][cat].append(fname)
-        index["files"][fname] = {
-            "category": cat,
-            "added": datetime.now().isoformat(),
-            "confidence": a.get("confidence", "N/A"),
-        }
+        # Update index (exclude uncategorized to keep those files re-routable).
+        if not _is_uncategorized_category(cat, cfg):
+            if cat not in index["categories"]:
+                index["categories"][cat] = []
+            index["categories"][cat].append(fname)
+            index["files"][fname] = {
+                "category": cat,
+                "added": datetime.now().isoformat(),
+                "confidence": a.get("confidence", "N/A"),
+            }
 
     save_index(root, cfg, index)
 
@@ -641,18 +809,28 @@ def _find_file(root: Path, fname: str) -> Path | None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="paper-sort: LLM-powered academic paper organizer",
+        description="pdf-sort: LLM-powered academic paper organizer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  paper-sort                    # Auto mode in current directory
-  paper-sort ~/Papers           # Auto mode in a specific directory
-  paper-sort --dry ~/Papers     # Preview without moving files
+  pdf-sort                    # Auto mode in current directory
+  pdf-sort ~/Papers           # Auto mode in a specific directory
+  pdf-sort --dry ~/Papers     # Preview without moving files
+  pdf-sort --model llama3.1 ~/Papers
+  pdf-sort --ollama-host http://localhost:11434 --model llama3.1 ~/Papers
         """,
     )
     parser.add_argument(
         "--dry", action="store_true",
         help="Dry run: show classification results without moving files"
+    )
+    parser.add_argument(
+        "--model",
+        help="Ollama model to use for classification (overrides pdf_sort_config.json)"
+    )
+    parser.add_argument(
+        "--ollama-host",
+        help="Ollama host URL (overrides pdf_sort_config.json)"
     )
     parser.add_argument(
         "root", nargs="?", default=".",
@@ -667,11 +845,19 @@ Examples:
         sys.exit(1)
 
     cfg = load_config(root)
+    if args.model:
+        cfg["model"] = args.model
+    if args.ollama_host:
+        cfg["ollama_host"] = args.ollama_host
 
-    if get_existing_categories(root):
-        run_incremental(root, cfg, dry=args.dry)
-    else:
-        run_init(root, cfg, dry=args.dry)
+    try:
+        if get_existing_categories(root):
+            run_incremental(root, cfg, dry=args.dry)
+        else:
+            run_init(root, cfg, dry=args.dry)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

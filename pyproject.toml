@@ -3,17 +3,18 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "paper-sort"
-version = "0.1.0"
+name = "pdf-sort"
+version = "0.2.0"
 description = "LLM-powered academic paper organizer"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "ollama>=0.6.0",
+    "tqdm>=4.66.0",
 ]
 
 [project.scripts]
-paper-sort = "paper_sort.cli:main"
+pdf-sort = "pdf_sort.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/paper_sort"]
+packages = ["src/pdf_sort"]
